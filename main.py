@@ -4,9 +4,9 @@ import json
 import csv
 import requests
 from bs4 import BeautifulSoup
-import pandas as pd
 import os
 import re
+import sys
 from datetime import datetime
 
 # Configure logging
@@ -112,7 +112,7 @@ def get_cve_details(cve_id):
     """
     try:
         url = f"{NIST_BASE_URL}?cveId={cve_id}"
-        response = requests.get(url)
+        response = requests.get(url, timeout=30)
         response.raise_for_status()  # Raise HTTPError for bad responses (4xx or 5xx)
 
         data = response.json()
@@ -134,7 +134,17 @@ def get_cve_details(cve_id):
         logging.error(f"An unexpected error occurred while retrieving CVE details for {cve_id}: {e}")
         return None
 
+_EXPLOITDB_CACHE = {}
+
 def search_exploitdb(search_term):
+    if search_term in _EXPLOITDB_CACHE:
+        return _EXPLOITDB_CACHE[search_term]
+    result = _search_exploitdb_uncached(search_term)
+    _EXPLOITDB_CACHE[search_term] = result
+    return result
+
+
+def _search_exploitdb_uncached(search_term):
     """
     Searches ExploitDB for exploits related to the given search term.
     This implementation uses web scraping since there's no official ExploitDB API.
@@ -147,8 +157,8 @@ def search_exploitdb(search_term):
             logging.warning(f"Invalid search term: {search_term}.  Only alphanumeric characters, hyphens, and underscores are allowed.")
             return []
 
-        search_url = f"{EXPLOITDB_URL}?q={search_term}"  # Construct the search URL
-        response = requests.get(search_url)
+        search_url = f"{EXPLOITDB_URL}?q={search_term}"
+        response = requests.get(search_url, timeout=30)
         response.raise_for_status() # Raise HTTPError for bad responses
 
         soup = BeautifulSoup(response.content, 'html.parser')
@@ -180,206 +190,127 @@ def generate_timeline(cve_details):
     :return: A list of tuples, where each tuple contains a date and a description of the event.
     """
     timeline = []
-
     if not cve_details:
         return timeline
-
-    # Add initial discovery date from NIST
-    if 'published' in cve_details:
+    published_date = None
+    last_modified_date = None
+    if 'published' in cve_details and cve_details['published']:
         published_date = datetime.fromisoformat(cve_details['published'].replace('Z', '+00:00'))
-        timeline.append((published_date, f"Vulnerability Published (NIST)"))
-
-    # Add last modified date from NIST
-    if 'lastModified' in cve_details:
+        timeline.append((published_date, "Vulnerability Published (NIST)"))
+    if 'lastModified' in cve_details and cve_details['lastModified']:
         last_modified_date = datetime.fromisoformat(cve_details['lastModified'].replace('Z', '+00:00'))
-        timeline.append((last_modified_date, f"Vulnerability Last Modified (NIST)"))
-
-    # Add description
-    # This reuses published_date from the block above, so a record
-    # with descriptions but no published field raises NameError here
-    # instead of producing a partial timeline. Also note where the
-    # timeline goes: main only logs it. generate_report never calls
-    # this function, so the file report contains no timeline at all.
+        timeline.append((last_modified_date, "Vulnerability Last Modified (NIST)"))
     if 'descriptions' in cve_details and cve_details['descriptions']:
-      description = cve_details['descriptions'][0]['value']
-      timeline.append((published_date, f"Description: {description}"))
-
-    timeline.sort(key=lambda x: x[0])  # Sort by date
+        description = cve_details['descriptions'][0]['value']
+        event_date = published_date or last_modified_date
+        if event_date is not None:
+            timeline.append((event_date, f"Description: {description}"))
+    timeline.sort(key=lambda x: x[0])
     return timeline
 
 
-def generate_report(vulnerability_data, asset_inventory, output_file, prioritize=False):
-    """
-    Generates a report of vulnerabilities, affected assets, and remediation recommendations.
+MAX_DESCRIPTION_CHARS = 500
 
-    :param vulnerability_data: A dictionary where keys are CVE IDs and values are CVE details.
-    :param asset_inventory:  A list of dictionaries containing asset information.
-    :param output_file: The path to the output file.
-    :param prioritize: Boolean value to indicate prioritization of remediation.
-    :return: None
-    """
-    report_lines = []
+def _cap_description(text):
+    text = text or ""
+    if len(text) > MAX_DESCRIPTION_CHARS:
+        return text[:MAX_DESCRIPTION_CHARS] + " [truncated]"
+    return text
 
-    if not vulnerability_data:
+
+def generate_report(vulnerability_data, asset_inventory, output_file, prioritize=False, asset_inventory_file=None):
+    """Build the report once, sort the built entries if prioritized, and write it. Returns True on a written report."""
+    if output_file and asset_inventory_file:
+        if os.path.realpath(output_file) == os.path.realpath(asset_inventory_file):
+            logging.error("Refusing to write the report over the asset inventory file.")
+            return False
+    entries = []
+    exploit_cache = {}
+    for cve_id, cve_details in (vulnerability_data or {}).items():
+        if not cve_details:
+            entries.append({'cve_id': cve_id, 'cve_details': None, 'score': 0.0, 'exploit_available': False})
+            continue
+        description = _cap_description(cve_details.get('descriptions', [{}])[0].get('value', 'No description available'))
+        cvss_v3_severity = cvss_v2_severity = cvss_v3_score = cvss_v2_score = None
+        metrics = cve_details.get('metrics', {})
+        if metrics.get('cvssMetricV31'):
+            d = metrics['cvssMetricV31'][0]['cvssData']; cvss_v3_severity, cvss_v3_score = d.get('baseSeverity'), d.get('baseScore')
+        elif metrics.get('cvssMetricV30'):
+            d = metrics['cvssMetricV30'][0]['cvssData']; cvss_v3_severity, cvss_v3_score = d.get('baseSeverity'), d.get('baseScore')
+        elif metrics.get('cvssMetricV2'):
+            d = metrics['cvssMetricV2'][0]['cvssData']; cvss_v2_severity, cvss_v2_score = d.get('baseSeverity'), d.get('baseScore')
+        if cve_id not in exploit_cache:
+            exploit_cache[cve_id] = search_exploitdb(cve_id)
+        exploit_urls = exploit_cache[cve_id]
+        affected = identify_affected_assets(cve_details, asset_inventory) if asset_inventory else []
+        entries.append({'cve_id': cve_id, 'cve_details': cve_details, 'description': description,
+                        'cvss_v3_severity': cvss_v3_severity, 'cvss_v3_score': cvss_v3_score,
+                        'cvss_v2_severity': cvss_v2_severity, 'cvss_v2_score': cvss_v2_score,
+                        'exploit_urls': exploit_urls, 'exploit_available': bool(exploit_urls),
+                        'affected_assets': affected,
+                        'recommendations': generate_remediation_recommendations(cve_details, affected),
+                        'score': cvss_v3_score if cvss_v3_score else 0.0})
+    if prioritize:
+        entries.sort(key=lambda x: (x['score'], x['exploit_available']), reverse=True)
+    report_lines = ["Prioritized Vulnerability Report:\n" if prioritize else "Vulnerability Report:\n"]
+    if not entries:
         report_lines.append("No vulnerability data to report.")
-    else:
-        report_lines.append("Vulnerability Report:\n")
-
-        # Prepare a list to hold data for prioritization
-        vulnerability_list = []
-
-        for cve_id, cve_details in vulnerability_data.items():
-            report_lines.append(f"CVE ID: {cve_id}")
-            if cve_details:
-                # Extract relevant information from CVE details
-                description = cve_details.get('descriptions', [{}])[0].get('value', 'No description available')
-                cvss_v3_severity = None
-                cvss_v2_severity = None
-                cvss_v3_score = None
-                cvss_v2_score = None
-
-                if 'metrics' in cve_details:
-                    if 'cvssMetricV31' in cve_details['metrics'] and cve_details['metrics']['cvssMetricV31']:
-                        cvss_v3_severity = cve_details['metrics']['cvssMetricV31'][0]['cvssData']['baseSeverity']
-                        cvss_v3_score = cve_details['metrics']['cvssMetricV31'][0]['cvssData']['baseScore']
-                    elif 'cvssMetricV30' in cve_details['metrics'] and cve_details['metrics']['cvssMetricV30']:
-                        cvss_v3_severity = cve_details['metrics']['cvssMetricV30'][0]['cvssData']['baseSeverity']
-                        cvss_v3_score = cve_details['metrics']['cvssMetricV30'][0]['cvssData']['baseScore']
-                    elif 'cvssMetricV2' in cve_details['metrics'] and cve_details['metrics']['cvssMetricV2']:
-                        cvss_v2_severity = cve_details['metrics']['cvssMetricV2'][0]['cvssData']['baseSeverity']
-                        cvss_v2_score = cve_details['metrics']['cvssMetricV2'][0]['cvssData']['baseScore']
-
-                report_lines.append(f"  Description: {description}")
-                report_lines.append(f"  CVSS v3 Severity: {cvss_v3_severity}, Score: {cvss_v3_score}")
-                report_lines.append(f"  CVSS v2 Severity: {cvss_v2_severity}, Score: {cvss_v2_score}")
-
-                # Search ExploitDB
-                exploit_urls = search_exploitdb(cve_id)
-                if exploit_urls:
-                    report_lines.append("  Exploits Available:")
-                    for url in exploit_urls:
-                        report_lines.append(f"    - {url}")
-                else:
-                    report_lines.append("  No exploits found on ExploitDB.")
-
-
-                # Identify affected assets (placeholder - needs actual logic)
-                affected_assets = identify_affected_assets(cve_details, asset_inventory) #Placeholder
-
-                if affected_assets:
-                    report_lines.append("  Affected Assets:")
-                    for asset in affected_assets:
-                        report_lines.append(f"    - Hostname: {asset['hostname']}, IP Address: {asset['ip_address']}")
-                else:
-                    report_lines.append("  No affected assets identified based on current matching logic.")
-
-
-                # Remediation recommendations (placeholder - needs actual logic)
-                remediation_recommendations = generate_remediation_recommendations(cve_details, affected_assets) #Placeholder
-
-                if remediation_recommendations:
-                    report_lines.append("  Remediation Recommendations:")
-                    for recommendation in remediation_recommendations:
-                        report_lines.append(f"    - {recommendation}")
-                else:
-                    report_lines.append("  No specific remediation recommendations available.")
-
-                report_lines.append("-" * 40)
-
-                # Add to the list for prioritization
-                vulnerability_list.append({
-                    'cve_id': cve_id,
-                    'cve_details': cve_details,
-                    'cvss_v3_score': cvss_v3_score if cvss_v3_score else 0.0, #Use a default value
-                    'exploit_available': bool(exploit_urls),
-                    'affected_assets': affected_assets
-                })
-
-
-            else:
-                report_lines.append("  Could not retrieve CVE details.")
-                report_lines.append("-" * 40)
-
-        # Prioritize if requested
-        if prioritize:
-            # Sort by CVSS score (highest first) and then by exploit availability (True first)
-            vulnerability_list.sort(key=lambda x: (x['cvss_v3_score'], x['exploit_available']), reverse=True)
-            report_lines = ["Prioritized Vulnerability Report:\n"]  # Reset report lines
-
-            for vuln in vulnerability_list:
-                cve_id = vuln['cve_id']
-                cve_details = vuln['cve_details']
-
-                report_lines.append(f"CVE ID: {cve_id} (PRIORITIZED)") #Mark it as prioritized
-                # Extract relevant information from CVE details
-                description = cve_details.get('descriptions', [{}])[0].get('value', 'No description available')
-                cvss_v3_severity = None
-                cvss_v2_severity = None
-                cvss_v3_score = None
-                cvss_v2_score = None
-
-                if 'metrics' in cve_details:
-                    if 'cvssMetricV31' in cve_details['metrics'] and cve_details['metrics']['cvssMetricV31']:
-                        cvss_v3_severity = cve_details['metrics']['cvssMetricV31'][0]['cvssData']['baseSeverity']
-                        cvss_v3_score = cve_details['metrics']['cvssMetricV31'][0]['cvssData']['baseScore']
-                    elif 'cvssMetricV30' in cve_details['metrics'] and cve_details['metrics']['cvssMetricV30']:
-                        cvss_v3_severity = cve_details['metrics']['cvssMetricV30'][0]['cvssData']['baseSeverity']
-                        cvss_v3_score = cve_details['metrics']['cvssMetricV30'][0]['cvssData']['baseScore']
-                    elif 'cvssMetricV2' in cve_details['metrics'] and cve_details['metrics']['cvssMetricV2']:
-                        cvss_v2_severity = cve_details['metrics']['cvssMetricV2'][0]['cvssData']['baseSeverity']
-                        cvss_v2_score = cve_details['metrics']['cvssMetricV2'][0]['cvssData']['baseScore']
-
-                report_lines.append(f"  Description: {description}")
-                report_lines.append(f"  CVSS v3 Severity: {cvss_v3_severity}, Score: {cvss_v3_score}")
-                report_lines.append(f"  CVSS v2 Severity: {cvss_v2_severity}, Score: {cvss_v2_score}")
-
-
-                # Search ExploitDB
-                # Redundant is the right word, and it costs more than
-                # time: the prioritized report is built by scraping
-                # ExploitDB a second time for every CVE, so its exploit
-                # lists can disagree with the first pass built above if
-                # the site changes or a request fails in between.
-                exploit_urls = search_exploitdb(cve_id) # Redundant but keeps output complete
-                if exploit_urls:
-                    report_lines.append("  Exploits Available:")
-                    for url in exploit_urls:
-                        report_lines.append(f"    - {url}")
-                else:
-                    report_lines.append("  No exploits found on ExploitDB.")
-
-                # Identify affected assets
-                affected_assets = identify_affected_assets(cve_details, asset_inventory)  # Placeholder
-
-                if affected_assets:
-                    report_lines.append("  Affected Assets:")
-                    for asset in affected_assets:
-                        report_lines.append(f"    - Hostname: {asset['hostname']}, IP Address: {asset['ip_address']}")
-                else:
-                    report_lines.append("  No affected assets identified based on current matching logic.")
-
-                # Remediation recommendations
-                remediation_recommendations = generate_remediation_recommendations(cve_details, affected_assets)  # Placeholder
-
-                if remediation_recommendations:
-                    report_lines.append("  Remediation Recommendations:")
-                    for recommendation in remediation_recommendations:
-                        report_lines.append(f"    - {recommendation}")
-                else:
-                    report_lines.append("  No specific remediation recommendations available.")
-
-                report_lines.append("-" * 40)
-
-
-    # Write the report to the output file
+    unmatchable = count_unmatchable_assets(asset_inventory) if asset_inventory else 0
+    if asset_inventory is not None:
+        report_lines.append(f"Assets with no matchable software, vendor, or product field: {unmatchable}")
+    for e in entries:
+        report_lines.append(f"CVE ID: {e['cve_id']}" + (" (PRIORITIZED)" if prioritize else ""))
+        if not e['cve_details']:
+            report_lines.append("  Could not retrieve CVE details.")
+            report_lines.append("-" * 40); continue
+        report_lines.append(f"  Description: {e['description']}")
+        report_lines.append(f"  CVSS v3 Severity: {e['cvss_v3_severity']}, Score: {e['cvss_v3_score']}")
+        report_lines.append(f"  CVSS v2 Severity: {e['cvss_v2_severity']}, Score: {e['cvss_v2_score']}")
+        if e['exploit_urls']:
+            report_lines.append("  Exploits Available:")
+            for url in e['exploit_urls']:
+                report_lines.append(f"    - {url}")
+        else:
+            report_lines.append("  No exploits found on ExploitDB.")
+        if e['affected_assets']:
+            report_lines.append("  Affected Assets:")
+            for asset in e['affected_assets']:
+                report_lines.append(f"    - Hostname: {asset['hostname']}, IP Address: {asset['ip_address']}")
+        else:
+            report_lines.append("  No affected assets identified based on current matching logic.")
+        if e['recommendations']:
+            report_lines.append("  Remediation Recommendations:")
+            for r in e['recommendations']:
+                report_lines.append(f"    - {_cap_description(r)}")
+        else:
+            report_lines.append("  No specific remediation recommendations available.")
+        report_lines.append("-" * 40)
+    if not output_file:
+        for line in report_lines:
+            print(line)
+        return True
     try:
         with open(output_file, 'w') as f:
             for line in report_lines:
                 f.write(line + '\n')
         logging.info(f"Report generated and saved to {output_file}")
-    except Exception as e:
-        logging.error(f"Error writing report to file: {e}")
+        return True
+    except Exception as ex:
+        logging.error(f"Error writing report to file: {ex}")
+        return False
 
+
+def count_unmatchable_assets(asset_inventory):
+    count = 0
+    for asset in asset_inventory or []:
+        usable = False
+        for field in ('software', 'vendor', 'product'):
+            v = asset.get(field)
+            if isinstance(v, str) and len(v.strip()) >= 4:
+                usable = True
+        if not usable:
+            count += 1
+    return count
 
 
 def identify_affected_assets(cve_details, asset_inventory):
@@ -398,23 +329,22 @@ def identify_affected_assets(cve_details, asset_inventory):
         return []
 
     affected_assets = []
-
-    # Simple example: Check if the CVE description mentions a software or vendor
-    # present in the asset inventory.  This is a very basic approach.
-    description = cve_details.get('descriptions', [{}])[0].get('value', '').lower() #Lower case for case-insensitive matching
+    description = cve_details.get('descriptions', [{}])[0].get('value', '').lower()
+    named_fields = ('software', 'vendor', 'product', 'hostname')
     for asset in asset_inventory:
-        hostname = asset.get('hostname', '').lower() #Lower case for case-insensitive matching
-        ip_address = asset.get('ip_address', '')
-
-        # The second half tests every string value in the asset row,
-        # not a software field: an IP, an owner name, any text at all
-        # that happens to appear in the CVE description marks the
-        # asset as affected. An empty hostname is worse: an empty
-        # string is contained in every description, so a row with a
-        # blank hostname matches every CVE unconditionally.
-        if hostname in description or any(software.lower() in description for software in asset.values() if isinstance(software, str)):
-            affected_assets.append(asset) #Adding the full asset dictionary
-
+        matched = False
+        for field in named_fields:
+            value = asset.get(field)
+            if not isinstance(value, str):
+                continue
+            value = value.strip().lower()
+            if len(value) < 4:
+                continue
+            if value in description:
+                matched = True
+                break
+        if matched:
+            affected_assets.append(asset)
     return affected_assets
 
 
@@ -457,7 +387,11 @@ def main():
 
     if not args.vulnerability_ids:
         logging.error("Please provide at least one vulnerability ID using the -v or --vulnerability_ids option.")
-        return
+        sys.exit(1)
+
+    if args.output_file and args.asset_inventory and os.path.realpath(args.output_file) == os.path.realpath(args.asset_inventory):
+        logging.error("Refusing to write the report over the asset inventory file.")
+        sys.exit(1)
 
     vulnerability_data = {}
 
@@ -472,23 +406,27 @@ def main():
         else:
             logging.warning(f"Could not retrieve details for {cve_id}.")
 
+    if not vulnerability_data:
+        logging.error("No CVE records were retrieved; no report can be generated.")
+        sys.exit(1)
+
     asset_inventory = None
     if args.asset_inventory:
         asset_inventory = load_asset_inventory(args.asset_inventory)
+        if asset_inventory is None:
+            logging.error("Asset inventory could not be loaded.")
+            sys.exit(1)
 
-
-    # A report file is written only on this branch. Run with CVEs and
-    # an --output_file but no inventory and the output argument is
-    # silently ignored: timelines in the log are the whole result.
-    if args.asset_inventory and vulnerability_data:
-        if not asset_inventory:
-            logging.error("Asset inventory could not be loaded, skipping report generation.")
-        else:
-           generate_report(vulnerability_data, asset_inventory, args.output_file or "vulnerability_report.txt", args.prioritize)
-    elif args.asset_inventory and not vulnerability_data:
-        logging.warning("Asset inventory provided, but no vulnerability data. Skipping report generation.")
-    elif not args.asset_inventory and vulnerability_data:
-        logging.info("Vulnerability data available, but no asset inventory provided.  Skipping asset-based reporting.")
+    if args.output_file:
+        ok = generate_report(vulnerability_data, asset_inventory, args.output_file, args.prioritize, asset_inventory_file=args.asset_inventory)
+        if not ok:
+            sys.exit(1)
+    elif args.asset_inventory:
+        ok = generate_report(vulnerability_data, asset_inventory, "vulnerability_report.txt", args.prioritize, asset_inventory_file=args.asset_inventory)
+        if not ok:
+            sys.exit(1)
+    else:
+        logging.info("Vulnerability data retrieved; no output file requested, timelines above are the result.")
 
     if args.exploitdb_search_term:
         exploits = search_exploitdb(args.exploitdb_search_term)
