@@ -195,6 +195,11 @@ def generate_timeline(cve_details):
         timeline.append((last_modified_date, f"Vulnerability Last Modified (NIST)"))
 
     # Add description
+    # This reuses published_date from the block above, so a record
+    # with descriptions but no published field raises NameError here
+    # instead of producing a partial timeline. Also note where the
+    # timeline goes: main only logs it. generate_report never calls
+    # this function, so the file report contains no timeline at all.
     if 'descriptions' in cve_details and cve_details['descriptions']:
       description = cve_details['descriptions'][0]['value']
       timeline.append((published_date, f"Description: {description}"))
@@ -330,6 +335,11 @@ def generate_report(vulnerability_data, asset_inventory, output_file, prioritize
 
 
                 # Search ExploitDB
+                # Redundant is the right word, and it costs more than
+                # time: the prioritized report is built by scraping
+                # ExploitDB a second time for every CVE, so its exploit
+                # lists can disagree with the first pass built above if
+                # the site changes or a request fails in between.
                 exploit_urls = search_exploitdb(cve_id) # Redundant but keeps output complete
                 if exploit_urls:
                     report_lines.append("  Exploits Available:")
@@ -396,6 +406,12 @@ def identify_affected_assets(cve_details, asset_inventory):
         hostname = asset.get('hostname', '').lower() #Lower case for case-insensitive matching
         ip_address = asset.get('ip_address', '')
 
+        # The second half tests every string value in the asset row,
+        # not a software field: an IP, an owner name, any text at all
+        # that happens to appear in the CVE description marks the
+        # asset as affected. An empty hostname is worse: an empty
+        # string is contained in every description, so a row with a
+        # blank hostname matches every CVE unconditionally.
         if hostname in description or any(software.lower() in description for software in asset.values() if isinstance(software, str)):
             affected_assets.append(asset) #Adding the full asset dictionary
 
@@ -461,6 +477,9 @@ def main():
         asset_inventory = load_asset_inventory(args.asset_inventory)
 
 
+    # A report file is written only on this branch. Run with CVEs and
+    # an --output_file but no inventory and the output argument is
+    # silently ignored: timelines in the log are the whole result.
     if args.asset_inventory and vulnerability_data:
         if not asset_inventory:
             logging.error("Asset inventory could not be loaded, skipping report generation.")
