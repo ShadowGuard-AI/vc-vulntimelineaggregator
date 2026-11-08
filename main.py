@@ -71,18 +71,19 @@ def load_asset_inventory(asset_inventory_file):
             with open(asset_inventory_file, 'r') as csvfile:
                 reader = csv.DictReader(csvfile)
                 inventory = list(reader)  # Store all records as a list of dictionaries
-                #Basic check for required keys
-                if not inventory or not all(key in inventory[0] for key in ['hostname', 'ip_address']):
+                if not inventory:
+                    logging.error("Asset inventory CSV file is empty.")
+                    return None
+                if not all(all(key in row for key in ['hostname', 'ip_address']) for row in inventory):
                     logging.error("Asset inventory CSV file is missing required columns (hostname, ip_address).")
                     return None
 
         elif asset_inventory_file.lower().endswith(".json"):
             with open(asset_inventory_file, 'r') as jsonfile:
                 inventory = json.load(jsonfile)  # Expects a list of dictionaries
-                #Basic check for required keys
-                if not isinstance(inventory, list) or not all(isinstance(item, dict) for item in inventory) or \
-                   not all(key in inventory[0] for key in ['hostname', 'ip_address']):
-                    logging.error("Asset inventory JSON file must be a list of dictionaries and include hostname, ip_address.")
+                if not isinstance(inventory, list) or not inventory or not all(isinstance(item, dict) for item in inventory) or \
+                   not all(all(key in item for key in ['hostname', 'ip_address']) for item in inventory):
+                    logging.error("Asset inventory JSON file must be a non-empty list of dictionaries that each include hostname and ip_address.")
                     return None
         else:
             logging.error("Unsupported asset inventory file format. Only CSV and JSON are supported.")
@@ -182,6 +183,12 @@ def _search_exploitdb_uncached(search_term):
         logging.error(f"An unexpected error occurred while searching ExploitDB for {search_term}: {e}")
         return []
 
+def _description_text(cve_details):
+    descriptions = (cve_details or {}).get('descriptions') or []
+    if descriptions and isinstance(descriptions[0], dict):
+        return descriptions[0].get('value', '') or ''
+    return ''
+
 def generate_timeline(cve_details):
     """
     Generates a chronological timeline of events related to a vulnerability.
@@ -230,14 +237,14 @@ def generate_report(vulnerability_data, asset_inventory, output_file, prioritize
         if not cve_details:
             entries.append({'cve_id': cve_id, 'cve_details': None, 'score': 0.0, 'exploit_available': False})
             continue
-        description = _cap_description(cve_details.get('descriptions', [{}])[0].get('value', 'No description available'))
+        description = _cap_description(_description_text(cve_details) or 'No description available')
         cvss_v3_severity = cvss_v2_severity = cvss_v3_score = cvss_v2_score = None
         metrics = cve_details.get('metrics', {})
         if metrics.get('cvssMetricV31'):
             d = metrics['cvssMetricV31'][0]['cvssData']; cvss_v3_severity, cvss_v3_score = d.get('baseSeverity'), d.get('baseScore')
         elif metrics.get('cvssMetricV30'):
             d = metrics['cvssMetricV30'][0]['cvssData']; cvss_v3_severity, cvss_v3_score = d.get('baseSeverity'), d.get('baseScore')
-        elif metrics.get('cvssMetricV2'):
+        if metrics.get('cvssMetricV2'):
             d = metrics['cvssMetricV2'][0]['cvssData']; cvss_v2_severity, cvss_v2_score = d.get('baseSeverity'), d.get('baseScore')
         if cve_id not in exploit_cache:
             exploit_cache[cve_id] = search_exploitdb(cve_id)
@@ -249,7 +256,7 @@ def generate_report(vulnerability_data, asset_inventory, output_file, prioritize
                         'exploit_urls': exploit_urls, 'exploit_available': bool(exploit_urls),
                         'affected_assets': affected,
                         'recommendations': generate_remediation_recommendations(cve_details, affected),
-                        'score': cvss_v3_score if cvss_v3_score else 0.0})
+                        'score': cvss_v3_score if cvss_v3_score is not None else (cvss_v2_score if cvss_v2_score is not None else 0.0)})
     if prioritize:
         entries.sort(key=lambda x: (x['score'], x['exploit_available']), reverse=True)
     report_lines = ["Prioritized Vulnerability Report:\n" if prioritize else "Vulnerability Report:\n"]
@@ -329,7 +336,7 @@ def identify_affected_assets(cve_details, asset_inventory):
         return []
 
     affected_assets = []
-    description = cve_details.get('descriptions', [{}])[0].get('value', '').lower()
+    description = _description_text(cve_details).lower()
     named_fields = ('software', 'vendor', 'product', 'hostname')
     for asset in asset_inventory:
         matched = False
@@ -365,7 +372,7 @@ def generate_remediation_recommendations(cve_details, affected_assets):
         return recommendations
 
     # Simple example: Suggest patching or upgrading the affected software
-    description = cve_details.get('descriptions', [{}])[0].get('value', '') #Get description
+    description = _description_text(cve_details)
     recommendations.append(f"Review the vulnerability description: {description}")
 
     #Check if any specific vendor advisory is available
@@ -404,9 +411,10 @@ def main():
             for date, event in timeline:
                 logging.info(f"  {date}: {event}")
         else:
+            vulnerability_data[cve_id] = None
             logging.warning(f"Could not retrieve details for {cve_id}.")
 
-    if not vulnerability_data:
+    if not any(vulnerability_data.values()):
         logging.error("No CVE records were retrieved; no report can be generated.")
         sys.exit(1)
 
